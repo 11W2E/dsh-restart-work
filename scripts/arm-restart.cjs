@@ -1,56 +1,50 @@
 #!/usr/bin/env node
-/* arm-restart.cjs — 给 dsh-power 看守写重启信号（插件自带 CLI）
+/* arm-restart.cjs — 给重启看守写一个「到点重启」请求
  *
- * 用法（agent 排程时调用；脚本可放任意目录，状态目录固定在 ~/.dsh/dsh-power）：
- *   ELECTRON_RUN_AS_NODE=1 electron.exe scripts/arm-restart.cjs \
- *     --minutes 2 --inject-delay-sec 60 --prompt-file <文本路径> [--note weekly-upgrade]
+ * 请求写到 <StateDir>/pending/restart-request.json，看守（计划任务）轮询到点执行。
+ * StateDir 默认 %USERPROFILE%\.dsh\restart-work，可用环境变量 DSH_RESTART_STATE_DIR 覆盖。
  *
- * 两个时间间隔由调用方（agent）决定，命令行优先级最高；没传时用「设置 → 电源管理」里
- * 保存的默认值（~/.dsh/dsh-power/supervisor-settings.json），再没有才用内置 2 分钟 / 60 秒：
- *   --minutes N           到点重启的延迟（分钟；0 = 立刻）
- *   --inject-delay-sec N  宿主起来后隔多久注入提示词（秒；0 = 立刻）
- * 请求文件：~/.dsh/dsh-power/pending/restart-request.json（Windows: %USERPROFILE%\.dsh\dsh-power\pending）
- * 看守（计划任务 DSH_supervisor）轮询它：到点重启 → 清 cookie → 宿主起来 → 注入。
+ * 用法：
+ *   node arm-restart.cjs --minutes 2 --inject-delay-sec 60 --prompt-file prompt.txt
+ *
+ * 参数：
+ *   --minutes N           多久后重启（分钟，0 = 立刻；默认 2）
+ *   --inject-delay-sec N  宿主起来后隔多久注入提示词（秒，0 = 立刻；默认 60）
+ *   --prompt TEXT         注入的提示词
+ *   --prompt-file PATH    从文件读提示词（推荐，避免引号/反斜杠被 shell 改写）
+ *   --note TEXT           备注，写进请求文件方便排查
+ *   --id TEXT             请求 id（默认时间戳）
+ *
+ * 退出码：0 成功；2 参数错；3 已存在未处理的请求。
  */
-const fs = require('fs');
-const os = require('os');
-const path = require('path');
+const fs = require('node:fs');
+const os = require('node:os');
+const path = require('node:path');
 
-// 状态目录与看守、清理器共用；DSH_POWER_STATE_DIR 可覆盖。
-const STATE = process.env.DSH_POWER_STATE_DIR || path.join(os.homedir(), '.dsh', 'dsh-power');
+const STATE = process.env.DSH_RESTART_STATE_DIR || path.join(os.homedir(), '.dsh', 'restart-work');
 const PEND = path.join(STATE, 'pending');
 const argv = process.argv.slice(2);
 function get(name, def) {
   const i = argv.indexOf(name);
   return i >= 0 && i + 1 < argv.length ? argv[i + 1] : def;
 }
-function num(name, def, min) {
+function num(name, def, min, max) {
   const raw = get(name, null);
   if (raw === null) return def;
   const v = Number(raw);
-  if (!Number.isFinite(v) || v < min) {
+  if (!Number.isFinite(v) || v < min || v > max) {
     console.error('bad ' + name + ': ' + raw);
     process.exit(2);
   }
   return v;
 }
-
-function savedSettings() {
-  try {
-    const raw = fs.readFileSync(path.join(STATE, 'supervisor-settings.json'), 'utf8');
-    return JSON.parse(raw) || {};
-  } catch {
-    return {};
-  }
-}
-const saved = savedSettings();
-const defMinutes = Number.isFinite(Number(saved.restartDelayMinutes)) ? Number(saved.restartDelayMinutes) : 2;
-const defInject = Number.isFinite(Number(saved.injectDelaySec)) ? Number(saved.injectDelaySec) : 60;
-const minutes = num('--minutes', defMinutes, 0);
-const injectDelaySec = num('--inject-delay-sec', defInject, 0);
+const minutes = num('--minutes', 2, 0, 1440);
+const injectDelaySec = num('--inject-delay-sec', 60, 0, 3600);
 let prompt = get('--prompt', '');
 const pf = get('--prompt-file', '');
-if (pf) prompt = fs.readFileSync(pf, 'utf8');
+if (pf) {
+  try { prompt = fs.readFileSync(pf, 'utf8'); } catch (e) { console.error('cannot read ' + pf + ': ' + e.message); process.exit(2); }
+}
 if (!prompt || !prompt.trim()) {
   console.error('need --prompt or --prompt-file');
   process.exit(2);
@@ -73,12 +67,11 @@ const req = {
   injectDelaySec,
   prompt,
   note: get('--note', ''),
-  createdBy: 'agent',
+  createdBy: 'arm-restart.cjs',
 };
 fs.mkdirSync(PEND, { recursive: true });
 const tmp = target + '.tmp';
 fs.writeFileSync(tmp, JSON.stringify(req, null, 2), 'utf8');
 fs.renameSync(tmp, target);
-console.log('armed id=' + id + ' restartAt=' + new Date(restartAt).toLocaleString('zh-CN') + ' injectDelaySec=' + injectDelaySec
-  + ' (minutes=' + minutes + (get('--minutes', null) === null ? ' 来自设置' : ' 命令行') + ')');
+console.log('armed id=' + id + ' restartAt=' + new Date(restartAt).toISOString() + ' injectDelaySec=' + injectDelaySec);
 console.log('request=' + target);
