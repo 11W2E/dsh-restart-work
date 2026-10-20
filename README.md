@@ -1,133 +1,132 @@
 # dsh-restart-work
 
-DSH Desktop（DeepSeek Harness 桌面版）的**重启工作**：由宿主体外的常驻看守（supervisor）按请求重启宿主，在旧宿主退出后清理陈旧认证 cookie，等新宿主就绪后再自动把提示词注入输入框并发送。
-
-一句话：**不需要人盯重启，也不需要人记得「重启完要发什么」。**
-
----
+让 **DeepSeek Harness 桌面版** 能「预约重启」：任意脚本或 agent 写下一条请求 —— *N 分钟后重启宿主，重启后自动把这段提示词发进会话* —— 之后不需要任何人点鼠标。
 
 ## 为什么需要它
 
-DSH Desktop 换插件、换配置后必须重启宿主才生效，但重启这件事在本机有三个硬约束：
+- DSH 桌面版是 Electron 应用，插件跑在宿主进程里。宿主被关闭/重启时，插件**没有机会执行收尾逻辑**（Windows 上通常是直接结束进程），所以「关闭后做点什么」只能交给宿主之外的进程。
+- 插件升级、配置变更都要重启宿主才生效；重启完还得有人跑到会话里做验收。
+- 这个仓库提供一个**独立常驻看守**（登录计划任务拉起，活在 DSH 进程树之外）：它按请求重启宿主，并在宿主重新起来后把验收提示词注入会话。
 
-1. **宿主不能自己重启自己。** 桌面壳启动的子进程都在同一个 Windows Job Object 里，宿主一退出整个进程树陪葬，症状是「只关闭、不打开」。重启必须由不属于该进程树的进程发起。
-2. **重启之后还有一步人工动作。** 验收脚本要在新宿主里跑（插件已加载、端口已就绪），这步留给人就等于每周一有个待办。
-3. **旧认证 cookie 会累积。** 桌面壳每次启动用随机端口，认证 cookie 名为 `dsh-auth-<hash(authority)>`，同主机不同端口各一条、默认 30 天不回收。约 70 次重启后 Cookie 头超过 Node 默认 16 KB 上限，宿主回 431，桌面壳 welcome 校验失败，启动即崩。
-
-本仓库把这三件事拼成一条无人值守的重启链路。
-
----
-
-## 重启链路
+## 链路
 
 ```
-调用方（任意脚本 / agent / 计划任务）
-   │  arm-restart.cjs --minutes N --inject-delay-sec M --prompt-file p.txt
-   ▼
-~/.dsh/dsh-power/pending/restart-request.json     ← 重启请求（含 prompt、两个间隔）
-   │
-   ▼  计划任务 DSH_supervisor（登录即起，独立于宿主进程树）
-supervisor.ps1  状态机 idle → restarting → waiting_up → idle
-   │ 到点：restart.cmd（taskkill → start） → 旧宿主退出
-   │
-   ├─ clean-auth-cookies.cjs：宿主退出后删 127.0.0.1/localhost/[::1] 的 dsh-auth-*，保留 dsh_pair
-   │
-   ▼ 新宿主进程出现 + 窗口就绪
-   │ 等 injectDelaySec（默认 60s，可设置）
-   ▼
-OCR 定位输入框坐标 → 点击 → 清空 → 粘贴提示词 → 校验回读 → Enter
-   │
-   ▼
-pending/inject-result.json + inject-results.ndjson（成功/失败、坐标、重试次数、截图证据）
+调用方（agent / 升级脚本 / 手动）
+      │  node arm-restart.cjs --minutes 2 --inject-delay-sec 60 --prompt-file prompt.txt
+      ▼
+<StateDir>/pending/restart-request.json      ← 请求文件（原子写，写完即生效）
+      │
+      ▼  看守（计划任务 DSH_restart_work，常驻）
+  到点 → 调 <StateDir>/restart.cmd          ← 结束宿主进程并重新启动（脚本可替换）
+      │
+      ▼  等宿主进程消失 → 等它重新出现
+  +injectDelaySec 秒
+      │
+      ▼  Win32 UI 自动化：找窗口 → 找会话输入框（OCR）→ 点击 → 粘贴 → 回车
+<StateDir>/pending/inject-result.json        ← 结果（ok / 失败原因 / 截图证据）
 ```
 
-状态机只在 **idle** 时触发重启（避免重启过程中又被下一轮触发，形成连环重启）；`restarting` 超过 180 秒宿主仍未换 pid 则放弃请求并记为 `restart-timeout`。
+## 目录结构
 
----
+默认 StateDir = `%USERPROFILE%\.dsh\restart-work`（可用环境变量 `DSH_RESTART_STATE_DIR` 覆盖）。
 
-## 组件
-
-| 文件 | 作用 |
+| 路径 | 作用 |
 | --- | --- |
-| `scripts/arm-restart.cjs` | 写重启请求；参数缺省取设置文件，默认 2 分钟 / 60 秒；已有未完成请求时退出码 3 |
-| `scripts/supervisor.ps1` | 常驻看守：到点重启、等宿主退出后清 cookie、等新宿主就绪后注入；状态机与日志都在 `~/.dsh/dsh-power/` |
-| `scripts/clean-auth-cookies.cjs` | 用 `node:sqlite` 打开 Chromium 的 `Network/Cookies`，删陈旧 `dsh-auth-*`，保留 `dsh_pair` |
-| `scripts/supervisor-control.mjs` | 注册/检查计划任务、读状态、写设置、arm/disarm；供插件或其他 Node 代码 import |
-| `scripts/weekly-upgrade.cjs` | 调用方示例：翻市场与 registry、判耦合、只装无耦合包、验收后排一次重启+注入 |
-| `scripts/upgrade.cjs` | 单包 check / analyze / apply / verify / contract / inventory |
+| `scripts/supervisor.ps1` | 看守本体：轮询请求、调 restart.cmd、等宿主、注入提示词、写日志与结果 |
+| `scripts/arm-restart.cjs` | 写请求的 CLI（Node 即可，无需依赖） |
+| `scripts/restart-sample.cmd` | restart.cmd 示例：taskkill + 等待退出 + 重新启动 |
+| `pending/restart-request.json` | 待处理请求（一个看守同时只处理一条） |
+| `pending/supervisor-state.json` | 看守自己的状态机，不要手改 |
+| `pending/inject-result.json` | 最近一次注入结果 |
+| `pending/done/` | 处理完的请求归档 |
+| `watch.log` | 只追加的运行日志（排障先看这里） |
+| `restart.cmd` | 真正的重启脚本，默认路径在 StateDir 下 |
 
-文档：
+## 快速开始
 
-- `docs/FLOW.md` —— 完整链路设计（调度 → 执行 → 编排 → 重启与注入 → 验收），含时序图、状态机、失败分支表
-- `docs/OPERATIONS.md` —— 日常操作、验收清单、回滚、日志位置、排障、安全边界
+1. 建目录并放文件（三份脚本放一起即可）：
 
----
+   ```powershell
+   $d = Join-Path $env:USERPROFILE '.dsh\restart-work'
+   New-Item -ItemType Directory -Force $d, (Join-Path $d 'pending') | Out-Null
+   # 把 scripts/supervisor.ps1、scripts/arm-restart.cjs 复制到 $d
+   # 把 scripts/restart-sample.cmd 复制成 $d\restart.cmd，改成你自己的 DSH 安装路径
+   ```
 
-## 快速开始（只启用「重启工作」）
+2. 装计划任务（登录时自动启动，退出登录前一直在）：
 
-前置：Windows、已安装 DSH Desktop、有 Electron（作为 node 运行脚本）。
+   ```powershell
+   powershell -NoProfile -ExecutionPolicy Bypass -File "$env:USERPROFILE\.dsh\restart-work\supervisor.ps1" -Install
+   ```
 
-```powershell
-# 1) 环境变量（不设则用推导默认值）
-$env:DSH_ELECTRON="C:\path\to\electron.exe"      # 必填示例：用于跑 .cjs
-$env:DSH_POWER_STATE_DIR="$env:USERPROFILE\.dsh\dsh-power"
+   默认任务名 `DSH_restart_work`，动作指向同一份 `supervisor.ps1`，状态目录同上。
 
-# 2) 注册看守计划任务（登录即启动，独立于宿主进程树）
-powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\supervisor.ps1 -TaskName DSH_supervisor # 首次也可用 supervisor-control.mjs 的 ensureSupervisor()
+3. 预约一次重启：
 
-# 3) 排一次重启（3 分钟后重启，重启后 60 秒注入 p.txt）
-node .\scripts\arm-restart.cjs --minutes 3 --inject-delay-sec 60 --prompt-file p.txt
+   ```powershell
+   node "$env:USERPROFILE\.dsh\restart-work\arm-restart.cjs" --minutes 2 --inject-delay-sec 60 --prompt-file C:\temp\prompt.txt
+   ```
 
-# 4) 看结果
-Get-Content "$env:USERPROFILE\.dsh\dsh-power\watch.log" -Tail 20
-Get-Content "$env:USERPROFILE\.dsh\dsh-power\pending\inject-result.json"
-```
+   两分钟后看守会重启 DSH；宿主起来 60 秒后，提示词被粘贴进会话输入框并回车发送。
 
-注：`supervisor.ps1` 是长驻循环脚本，由计划任务托管；`node` 可用 Electron 的 `ELECTRON_RUN_AS_NODE=1`。
-
----
+4. 看结果：`pending/inject-result.json` 与 `watch.log`。
 
 ## 两个间隔
 
-| 间隔 | 含义 | 默认 | 范围 |
-| --- | --- | --- | --- |
-| restartDelayMinutes | 从现在到重启的延迟 | 2 分钟 | 0–1440 |
-| injectDelaySec | 新宿主进程出现后等多久注入 | 60 秒 | 0–3600 |
+| 间隔 | 参数 | 默认 | 范围 | 谁决定 |
+| --- | --- | --- | --- | --- |
+| 多久后重启 | `--minutes`（请求字段 `minutes` / `restartAtMs`） | 2 分钟 | 0–1440 | 调用方，每次请求现定 |
+| 重启后多久注入 | `--inject-delay-sec`（请求字段 `injectDelaySec`） | 60 秒 | 0–3600 | 调用方，每次请求现定 |
 
-优先级：**内置默认 < 插件 config < 用户设置文件**（`~/.dsh/dsh-power/supervisor-settings.json`）。两个值都可被单次请求覆盖，调用方（agent / 脚本）可按场景自由指定，文档只给默认值。
+没有隐藏的全局配置：两个值都写在请求文件里，请求与行为一一对应。`supervisor.ps1` 的 `-PostUpDelaySec` 只在请求没写该字段时兜底。
 
----
+## 请求文件格式
 
-## 与「每周自动更新」的关系
+`pending/restart-request.json`：
 
-`scripts/weekly-upgrade.cjs` 是调用方示例，不是本仓库的主线：
-
+```json
+{
+  "id": "20261020134631",
+  "createdAtMs": 1760951191000,
+  "restartAtMs": 1760951311000,
+  "minutes": 2,
+  "injectDelaySec": 60,
+  "prompt": "重启后请跑一遍验收脚本，用 3 行汇报结果。",
+  "note": "plugin-upgrade"
+}
 ```
-检查更新 → 四点耦合判定（C1–C4）→ 只装 NO_ADAPT → verify → arm-restart 排程 → 重启后注入验收提示词 → 汇报
+
+- 只认 `restartAtMs`（毫秒时间戳）决定何时重启。
+- `injectDelaySec` 缺省时用看守的 `-PostUpDelaySec`（默认 60）。
+- 已有未处理请求时，`arm-restart.cjs` 退出码 3，不会覆盖。
+
+## 结果怎么读
+
+`pending/inject-result.json`：
+
+```json
+{ "id": "20261020134631", "ok": true, "reason": "", "detail": "point 960,833 attempt 1",
+  "at": "2026-10-20T14:50:42.1234567+08:00", "evidence": ["...-before.png", "...-after.png", "...-ocr.txt"] }
 ```
 
-也就是说：**重启工作负责「怎么安全地重启并让它自己验收」，更新只是其中一个使用场景。** 任何需要「重启后自动做一件事」的流程都可以复用这条链路。
+`ok=false` 时 `reason` 取值：`focus-failed` / `verify-failed` / `inject-abort` / `restart-timeout` / `expired`。各原因含义与处理见 [docs/OPERATIONS.md](docs/OPERATIONS.md)。
 
----
+## 边界与安全
 
-## 边界与限制
+- **Windows 10/11**。注入依赖 Win32 UI 自动化（找窗口、置前、移动指针点击、剪贴板、SendInput），必须有可交互的桌面会话；锁屏、断开的远程桌面下不保证成功。
+- 看守必须由**计划任务或服务**拉起。不要从 DSH 里 spawn 它：DSH 的 Job Object 会把子进程一起杀掉。
+- 不修改 DSH 的代码、不注入进程、不读会话内容；只是把一段你给的文本粘贴进输入框再回车。
+- OCR 用系统语言包（`Windows.Media.Ocr`）。没有可用语言包时注入会失败并在日志里说明。
+- 请求文件是唯一的控制面：想取消就删掉它（看守会回到空闲）。
 
-- 仅 Windows；看守与注入依赖 Win32 API（SetCursorPos / mouse_event / 剪贴板 / Windows.Media.Ocr）与 PowerShell 5.1+。
-- OCR 注入要求宿主窗口可见、输入框在屏幕上可定位；锁屏、远程会话最小化、多显示器缩放异常时可能失败（失败会记 `inject-result.json`，不会静默）。
-- 重启由 `restart.cmd` 执行（默认由 dsh-power 插件生成）；本仓库不发布该生成器，请按自己的安装方式提供。
-- `scripts/` 中的脚本按「工作区 + 插件状态目录」组织；放进你的环境时改环境变量即可，无需改代码。
-- 看守的 HTTP 控制路由复用宿主认证，裸 curl 返回 401 属正常；agent 侧走 CLI（`arm-restart.cjs`）。
+## 卸载
 
----
-
-## 安全
-
-- cookie 清理只删 `host_key IN ('127.0.0.1','localhost','[::1]')` 且 `name LIKE 'dsh-auth-%'` 的行，保留配对 cookie 与其他站点。
-- 看守只在自己的状态目录读写请求/状态/日志，不写宿主目录。
-- 不包含任何主机名、IP、账号、cookie 值；路径全部来自环境变量或 `os.homedir()`。
-
----
+```powershell
+Stop-ScheduledTask -TaskName DSH_restart_work
+Unregister-ScheduledTask -TaskName DSH_restart_work -Confirm:$false
+Remove-Item -Recurse -Force (Join-Path $env:USERPROFILE '.dsh\restart-work')
+```
 
 ## License
 
-MIT，见 [LICENSE](LICENSE)。
+MIT
