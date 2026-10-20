@@ -1,36 +1,42 @@
-<#
-supervisor.ps1 — DSH 看守（dsh-power 插件自带；由计划任务 DSH_supervisor 拉起，独立于 DSH 进程）
+﻿<#
+supervisor.ps1 — DSH 桌面版「重启工作」看守（独立进程，由登录计划任务常驻）
 
 职责：
-  1) DSH 关闭后清理陈旧 dsh-auth-* cookie（清理器 = 同目录 clean-auth-cookies.cjs）
-  2) 读到 pending/restart-request.json 时按 restartAtMs 调 restart.cmd 重启
-  3) 新宿主起来后等 injectDelaySec 秒（请求里指定，默认 60），读屏定位输入框、粘贴提示词、回车发送
-  4) 全程写 watch.log 与 pending/inject-result.json，下次会话的 agent 读裁决
+  1) 轮询 pending/restart-request.json，到 restartAtMs 时调用 restart.cmd 重启宿主
+  2) 宿主退出后等它重新起来
+  3) 起来后等 injectDelaySec 秒（请求里指定，缺省 60），读屏定位输入框、粘贴提示词、回车发送
+  4) 全程写 watch.log 与 pending/inject-result.json，供下一次会话的 agent 读裁决
 
-请求文件（agent 用 scripts/arm-restart.cjs 或 POST /dsh-power/api/arm 写）：
-  pending/restart-request.json = { id, createdAtMs, restartAtMs, minutes, injectDelaySec, prompt, note }
+请求文件（同目录 arm-restart.cjs 或任意脚本写）：
+  <StateDir>/pending/restart-request.json = { id, createdAtMs, restartAtMs, minutes, injectDelaySec, prompt, note }
 
-状态目录：~/.dsh/dsh-power/pending    日志：~/.dsh/dsh-power/watch.log
+默认目录（%USERPROFILE%\.dsh\restart-work）：
+  pending/restart-request.json   信号文件，写完即生效
+  pending/supervisor-state.json  看守状态机（不要手改）
+  pending/inject-result.json     最近一次注入结果
+  pending/done/                  已归档请求
+  watch.log                      仅追加日志
+  restart.cmd                    真正的重启脚本（杀宿主再启动，可自己换）
 #>
 param(
   [string]$Image = 'DeepSeek Harness',
-  [string]$TaskName = 'DSH_supervisor',
-  # 默认值全部从 $env:USERPROFILE 派生，换机器不用改脚本；计划任务注册时可用参数覆盖。
-  [string]$Electron = (Join-Path $env:USERPROFILE '.dsh\electron\electron.exe'),
-  [string]$Cleaner = '',
-  [string]$Log = (Join-Path $env:USERPROFILE '.dsh\dsh-power\watch.log'),
-  [string]$PendingDir = (Join-Path $env:USERPROFILE '.dsh\dsh-power\pending'),
-  [string]$RestartCmd = (Join-Path $env:USERPROFILE '.dsh\dsh-power\restart.cmd'),
+  [string]$TaskName = 'DSH_restart_work',
+  [string]$StateDir = (Join-Path $env:USERPROFILE '.dsh\restart-work'),
+  [string]$RestartCmd = '',
+  [string]$Log = '',
+  [string]$PendingDir = '',
   [int]$PostUpDelaySec = 60,
   [int]$ExpireMin = 30,
-  [string]$CleanerArgs = '',
   [switch]$Install,
   [switch]$InjectNow,
   [string]$TestPrompt = ''
 )
 
-# 清理器默认取同目录那份：整包（supervisor.ps1 + clean-auth-cookies.cjs）搬到哪都能跑。
-if (-not $Cleaner) { $Cleaner = Join-Path $PSScriptRoot 'clean-auth-cookies.cjs' }
+if (-not $PendingDir) { $PendingDir = Join-Path $StateDir 'pending' }
+if (-not $Log) { $Log = Join-Path $StateDir 'watch.log' }
+if (-not $RestartCmd) { $RestartCmd = Join-Path $StateDir 'restart.cmd' }
+if (-not (Test-Path -LiteralPath $StateDir)) { New-Item -ItemType Directory -Path $StateDir -Force | Out-Null }
+if (-not (Test-Path -LiteralPath $PendingDir)) { New-Item -ItemType Directory -Path $PendingDir -Force | Out-Null }
 
 $ErrorActionPreference = 'SilentlyContinue'
 $script:PSExe = Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\powershell.exe'
@@ -309,26 +315,6 @@ function Invoke-Inject([string]$prompt, [string]$id) {
   return [pscustomobject]$res
 }
 
-function Invoke-Cleaner([string]$why) {
-  Write-WatchLog ('cleaner: ' + $why)
-  $cleanLog = Join-Path $env:USERPROFILE '.dsh\dsh-power\cleanup-cookies.log'
-  if ($CleanerArgs -match '--log\s+([^\s]+)') { $cleanLog = $Matches[1] }
-  $env:ELECTRON_RUN_AS_NODE = '1'
-  $argv = @($Cleaner, '--proc', ($Image + '.exe'))
-  if ($CleanerArgs) { $argv += ($CleanerArgs -split '\s+' | Where-Object { $_ }) }
-  for ($i = 1; $i -le 3; $i++) {
-    try {
-      & $Electron @argv *> $null
-      Write-WatchLog ('cleaner exit=' + $LASTEXITCODE)
-    } catch { Write-WatchLog ('cleaner failed'); break }
-    $last = ''
-    try { $last = ((Get-Content -LiteralPath $cleanLog -ErrorAction SilentlyContinue) | Select-Object -Last 1) } catch { }
-    if (-not ($last -match 'SKIP|not touching')) { break }
-    if ($i -lt 3) { Start-Sleep -Seconds 2 }
-  }
-  Remove-Item Env:ELECTRON_RUN_AS_NODE -ErrorAction SilentlyContinue
-}
-
 function Start-Restart {
   Write-WatchLog ('restart: launching ' + $RestartCmd)
   try { Start-Process -FilePath 'cmd.exe' -ArgumentList '/c', ('"' + $RestartCmd + '"') -WindowStyle Hidden | Out-Null } catch { Write-WatchLog 'restart: launch failed' }
@@ -394,13 +380,11 @@ if ($InjectNow) {
 
 # ---------------- 安装计划任务 ----------------
 if ($Install) {
-  $arg = '-NoProfile -NonInteractive -WindowStyle Hidden -ExecutionPolicy Bypass -File "' + $PSCommandPath + '" -Image "' + $Image + '" -TaskName "' + $TaskName + '" -PendingDir "' + $PendingDir + '"'
+  $arg = '-NoProfile -NonInteractive -WindowStyle Hidden -ExecutionPolicy Bypass -File "' + $PSCommandPath + '" -Image "' + $Image + '" -TaskName "' + $TaskName + '" -StateDir "' + $StateDir + '" -RestartCmd "' + $RestartCmd + '"'
   $action = New-ScheduledTaskAction -Execute $script:PSExe -Argument $arg
   $trigger = New-ScheduledTaskTrigger -AtLogOn
   $settings = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -StartWhenAvailable -MultipleInstances IgnoreNew -ExecutionTimeLimit ([TimeSpan]::Zero)
-  Register-ScheduledTask -TaskName $TaskName -Action $action -Trigger $trigger -Settings $settings -Description 'DSH 看守：cookie 清理 + 重启编排 + 重启后自动注入' -Force | Out-Null
-  try { Unregister-ScheduledTask -TaskName 'DSH_cookie_watch' -Confirm:$false -ErrorAction SilentlyContinue } catch { }
-  Get-CimInstance Win32_Process -Filter "Name='powershell.exe'" -ErrorAction SilentlyContinue | Where-Object { $_.CommandLine -match 'watch-dsh-exit\.ps1' } | ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }
+  Register-ScheduledTask -TaskName $TaskName -Action $action -Trigger $trigger -Settings $settings -Description 'DSH 重启工作：按请求重启宿主 + 重启后自动注入提示词' -Force | Out-Null
   Start-ScheduledTask -TaskName $TaskName
   Start-Sleep -Seconds 3
   $t = Get-ScheduledTask -TaskName $TaskName
@@ -421,7 +405,6 @@ if (-not (Test-Path -LiteralPath $PendingDir)) { New-Item -ItemType Directory -P
 Write-WatchLog ('supervisor start pid=' + $PID + ' image=' + $Image + ' pending=' + $PendingDir)
 $script:State = Read-State
 $prev = Test-HostRunning
-if (-not $prev) { Invoke-Cleaner 'startup (host not running)' }
 $armedLogged = $false
 while ($true) {
   Start-Sleep -Seconds 2
@@ -457,7 +440,6 @@ while ($true) {
   if ($prev -and -not $running) {
     Start-Sleep -Seconds 2
     if (-not (Test-HostRunning)) {
-      Invoke-Cleaner 'host exited'
       if ($req) {
         Write-WatchLog ('host exited; request ' + $req.id + ' -> wait host up')
         $script:State = [ordered]@{ phase = 'waiting_up'; id = $req.id; goneAtMs = [long]$now; injectAtMs = 0; restartAtMs = 0 }
