@@ -5,12 +5,14 @@
 ```powershell
 $d = Join-Path $env:USERPROFILE '.dsh\restart-work'
 New-Item -ItemType Directory -Force $d, (Join-Path $d 'pending') | Out-Null
-# 放好 supervisor.ps1 / arm-restart.cjs / restart.cmd
-powershell -NoProfile -ExecutionPolicy Bypass -File "$d\supervisor.ps1" -Install
+# 放好 supervisor.ps1 / arm-restart.cjs / restart.ps1
+powershell -NoProfile -ExecutionPolicy Bypass -File "$d\supervisor.ps1" -Install -RestartCmd "$d\restart.ps1"
 ```
 
 `-Install` 会注册（或覆盖）计划任务，任务名默认 `DSH_restart_work`，登录时自动启动，动作就是
-`powershell.exe -File <supervisor.ps1> -Image "DeepSeek Harness" -TaskName DSH_restart_work -StateDir <StateDir> -RestartCmd <StateDir>\restart.cmd`。
+`powershell.exe -File <supervisor.ps1> -Image "DeepSeek Harness" -TaskName DSH_restart_work -StateDir <StateDir> -RestartCmd <StateDir>\restart.ps1`。
+
+重启脚本推荐用 `.ps1`（`Start-Restart` 会用 Windows PowerShell 直接执行）；若坚持用 `.cmd`，文件必须是 CRLF 换行，否则 cmd.exe 在 LF 下会静默不执行——表现为 `watch.log` 有 `restart: launching` 但宿主没被杀。
 
 升级看守：替换 `supervisor.ps1`，然后 `Stop-ScheduledTask` + `Start-ScheduledTask`（或重跑 `-Install`）。
 

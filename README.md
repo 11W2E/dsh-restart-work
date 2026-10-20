@@ -34,13 +34,13 @@
 | --- | --- |
 | `scripts/supervisor.ps1` | 看守本体：轮询请求、调 restart.cmd、等宿主、注入提示词、写日志与结果 |
 | `scripts/arm-restart.cjs` | 写请求的 CLI（Node 即可，无需依赖） |
-| `scripts/restart-sample.cmd` | restart.cmd 示例：taskkill + 等待退出 + 重新启动 |
+| `scripts/restart-sample.ps1` | 重启脚本示例（推荐）：结束进程 + 等待退出 + 重新启动 |
 | `pending/restart-request.json` | 待处理请求（一个看守同时只处理一条） |
 | `pending/supervisor-state.json` | 看守自己的状态机，不要手改 |
 | `pending/inject-result.json` | 最近一次注入结果 |
 | `pending/done/` | 处理完的请求归档 |
 | `watch.log` | 只追加的运行日志（排障先看这里） |
-| `restart.cmd` | 真正的重启脚本，默认路径在 StateDir 下 |
+| `restart.ps1` / `restart.cmd` | 真正的重启脚本；`.ps1` 由 Windows PowerShell 直接执行（推荐），`.cmd` 必须是 CRLF 换行 |
 
 ## 快速开始
 
@@ -50,13 +50,14 @@
    $d = Join-Path $env:USERPROFILE '.dsh\restart-work'
    New-Item -ItemType Directory -Force $d, (Join-Path $d 'pending') | Out-Null
    # 把 scripts/supervisor.ps1、scripts/arm-restart.cjs 复制到 $d
-   # 把 scripts/restart-sample.cmd 复制成 $d\restart.cmd，改成你自己的 DSH 安装路径
+   # 把 scripts/restart-sample.ps1 复制成 $d\restart.ps1，改脚本里的 -Exe 路径
+   # （用 restart.ps1 时，下一步安装要加 -RestartCmd "$d\restart.ps1"）
    ```
 
 2. 装计划任务（登录时自动启动，退出登录前一直在）：
 
    ```powershell
-   powershell -NoProfile -ExecutionPolicy Bypass -File "$env:USERPROFILE\.dsh\restart-work\supervisor.ps1" -Install
+   powershell -NoProfile -ExecutionPolicy Bypass -File "$env:USERPROFILE\.dsh\restart-work\supervisor.ps1" -Install -RestartCmd "$env:USERPROFILE\.dsh\restart-work\restart.ps1"
    ```
 
    默认任务名 `DSH_restart_work`，动作指向同一份 `supervisor.ps1`，状态目录同上。

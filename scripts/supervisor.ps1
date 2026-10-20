@@ -317,7 +317,12 @@ function Invoke-Inject([string]$prompt, [string]$id) {
 
 function Start-Restart {
   Write-WatchLog ('restart: launching ' + $RestartCmd)
-  try { Start-Process -FilePath 'cmd.exe' -ArgumentList '/c', ('"' + $RestartCmd + '"') -WindowStyle Hidden | Out-Null } catch { Write-WatchLog 'restart: launch failed' }
+  # .ps1 用 Windows PowerShell 直接跑（不受批处理 CRLF/LF 影响）；其余（.cmd/.bat/.exe）走 cmd /c
+  if ($RestartCmd -match '\.ps1$') {
+    try { Start-Process -FilePath $script:PSExe -ArgumentList '-NoProfile', '-NonInteractive', '-WindowStyle', 'Hidden', '-ExecutionPolicy', 'Bypass', '-File', ('"' + $RestartCmd + '"') -WindowStyle Hidden | Out-Null } catch { Write-WatchLog 'restart: launch failed' }
+  } else {
+    try { Start-Process -FilePath 'cmd.exe' -ArgumentList '/c', ('"' + $RestartCmd + '"') -WindowStyle Hidden | Out-Null } catch { Write-WatchLog 'restart: launch failed' }
+  }
 }
 
 function Read-Json($path) {
